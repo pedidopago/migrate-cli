@@ -23,7 +23,20 @@ var (
 	databaseURL = flag.String("database-url", "", "Database URL")
 	command     = flag.String("command", "_default_", "Migration command")
 	migrations  = flag.String("migrations", "", "Migrations directory (ex: file://database/migrations)")
+	// lockWaitTimeout is seconds, and -1 means "not set here". Production
+	// servers routinely carry lock_wait_timeout=86400 -- a full day -- and that
+	// turns one blocked ALTER into an outage: even an ALGORITHM=INSTANT change
+	// needs a brief exclusive metadata lock, MDL requests are FIFO, and every
+	// query on that table queues behind the one that is waiting. Failing in
+	// seconds and retrying costs a run; waiting a day costs the table.
+	lockWaitTimeout = flag.Int("lock-wait-timeout", -1, "Seconds to wait for a metadata lock before giving up (0 = leave the server default)")
+	allowDown       = flag.Bool("allow-down", false, "Permit migrations that move the schema BACKWARDS")
 )
+
+// defaultLockWaitTimeout applies when neither the flag, the env nor the DSN says
+// otherwise. Long enough to ride out ordinary contention, short enough that a
+// blocked ALTER gives up instead of holding the queue.
+const defaultLockWaitTimeout = 10
 
 func Run() {
 	slog.Info("starting migrations app")
@@ -65,12 +78,37 @@ func Run() {
 		os.Exit(1)
 	}
 
-	if !strings.Contains(*databaseURL, "multiStatements") {
-		if !strings.Contains(*databaseURL, "?") {
-			*databaseURL += "?multiStatements=true"
+	if v := os.Getenv("MIGRATION_LOCK_WAIT_TIMEOUT"); v != "" {
+		if *lockWaitTimeout != -1 {
+			slog.Warn("detected env MIGRATION_LOCK_WAIT_TIMEOUT, but the lock-wait-timeout parameter is already set; will ignore env")
+		} else if n, err := strconv.Atoi(v); err != nil {
+			slog.Error("MIGRATION_LOCK_WAIT_TIMEOUT is not a number", slog.String("value", v))
+			os.Exit(1)
 		} else {
-			*databaseURL += "&multiStatements=true"
+			*lockWaitTimeout = n
 		}
+	}
+
+	if os.Getenv("MIGRATION_ALLOW_DOWN") == "true" {
+		*allowDown = true
+	}
+
+	// Carried on the DSN rather than a SET after connecting: the migrate driver
+	// runs on a pool, and a session variable set on one connection does not
+	// reach the others. An explicit lock_wait_timeout already in the URL wins.
+	if !strings.Contains(*databaseURL, "lock_wait_timeout") {
+		t := *lockWaitTimeout
+		if t == -1 {
+			t = defaultLockWaitTimeout
+		}
+		if t > 0 {
+			*databaseURL = appendDSNParam(*databaseURL, "lock_wait_timeout="+strconv.Itoa(t))
+			slog.Info("lock wait timeout set for this run", slog.Int("seconds", t))
+		}
+	}
+
+	if !strings.Contains(*databaseURL, "multiStatements") {
+		*databaseURL = appendDSNParam(*databaseURL, "multiStatements=true")
 	}
 
 	slog.Debug("will open a connection to the database")
@@ -108,10 +146,13 @@ func Run() {
 		}
 	}
 
+	// Every path that can move the schema backwards is refused unless it was
+	// asked for. See refuseDown for why the guard is not just on "down".
 	switch *command {
 	case "up", "u":
 		err = m.Up()
 	case "down", "d":
+		refuseDown(db, "the down command rolls back EVERY migration")
 		err = m.Down()
 	case "force", "f":
 		if len(args) < 2 {
@@ -136,10 +177,14 @@ func Run() {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(5)
 		}
+		if steps < 0 {
+			refuseDown(db, fmt.Sprintf("a step count of %d rolls back %d migration(s)", steps, -steps))
+		}
 		err = m.Steps(steps)
 	case "sync":
 		mainDir := strings.TrimPrefix(*migrations, "file://")
 		maxv := maxMigrationVersion(mainDir)
+		refuseDownTo(db, maxv, "sync")
 		err = m.Migrate(uint(maxv))
 	case "new":
 		if len(args) < 2 {
@@ -196,6 +241,7 @@ func Run() {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(10)
 		}
+		refuseDownTo(db, uint(version), *command)
 		err = m.Migrate(uint(version))
 	}
 	if err != nil {
@@ -252,6 +298,13 @@ func logMigrationDataHeader(db *sql.DB, migrationsPath string) {
 		}
 	}
 
+	if db != nil {
+		var lwt uint64
+		if err := db.QueryRow("SELECT @@session.lock_wait_timeout").Scan(&lwt); err == nil {
+			slog.Info("lock_wait_timeout in force for this session", slog.Uint64("seconds", lwt))
+		}
+	}
+
 	up, down := lastMigrationVersions(migrationsPath)
 	slog.Info("migrations available", slog.Uint64("last_up", uint64(up)), slog.Uint64("last_down", uint64(down)))
 }
@@ -290,4 +343,63 @@ func lastMigrationVersions(migrationsPath string) (up, down uint) {
 		return nil
 	})
 	return up, down
+}
+
+// refuseDown stops a backwards migration unless it was explicitly asked for.
+//
+// The default assumes production, because that is where this runs unattended as
+// an init container. A rollback there is not a mistake to be logged -- it drops
+// columns and tables from a live database, and golang-migrate runs each file
+// untransacted, so a down that fails half way leaves the schema in a shape
+// nobody designed.
+func refuseDown(db *sql.DB, what string) {
+	if *allowDown {
+		slog.Warn("proceeding with a BACKWARDS migration because it was explicitly allowed", slog.String("reason", what))
+		return
+	}
+	slog.Error("refusing to migrate backwards",
+		slog.String("reason", what),
+		slog.String("hint", "pass --allow-down (or MIGRATION_ALLOW_DOWN=true) if this is really what you want"))
+	if db != nil {
+		_ = db.Close()
+	}
+	os.Exit(11)
+}
+
+// refuseDownTo is the same guard for the commands that name a target version
+// instead of a direction. `sync` and a bare version number both call Migrate,
+// which moves the schema DOWN when the database is ahead of the target -- which
+// is exactly what happens when an older image is deployed over a newer schema.
+// Guarding only the `down` command would leave that door open, and it is the
+// door that opens by accident.
+func refuseDownTo(db *sql.DB, target uint, label string) {
+	current, ok := currentVersion(db)
+	if !ok || current <= uint64(target) {
+		return
+	}
+	refuseDown(db, fmt.Sprintf("%s targets version %d but the database is at %d", label, target, current))
+}
+
+// currentVersion reads schema_migrations. ok is false when there is nothing to
+// compare against -- a fresh database, or a read that failed -- and the caller
+// then lets the migration proceed: refusing on a failed read would block every
+// deploy the moment the query breaks.
+func currentVersion(db *sql.DB) (version uint64, ok bool) {
+	if db == nil {
+		return 0, false
+	}
+	var dirty bool
+	if err := db.QueryRow("SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&version, &dirty); err != nil {
+		return 0, false
+	}
+	return version, true
+}
+
+// appendDSNParam adds a query parameter to a DSN, with or without an existing
+// query string.
+func appendDSNParam(dsn, param string) string {
+	if strings.Contains(dsn, "?") {
+		return dsn + "&" + param
+	}
+	return dsn + "?" + param
 }
