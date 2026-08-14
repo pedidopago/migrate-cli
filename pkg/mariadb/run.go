@@ -2,6 +2,7 @@ package mariadb
 
 import (
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	sqldriver "github.com/go-sql-driver/mysql"
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/golang-migrate/migrate/v4/database/mysql"
@@ -83,6 +85,8 @@ func Run() {
 	}
 
 	fmt.Println("connected to the database")
+
+	logMigrationDataHeader(db, strings.TrimPrefix(*migrations, "file://"))
 
 	if os.Getenv("SKIP_ALL") == "true" {
 		fmt.Println("SKIP_ALL is true, will skip migration")
@@ -210,18 +214,80 @@ func Run() {
 
 func maxMigrationVersion(migrationsPath string) uint {
 	var maxn uint = 0
-	filepath.Walk(migrationsPath, func(path string, info fs.FileInfo, err error) error {
-		if strings.HasSuffix(path, ".sql") {
-			_, fname := filepath.Split(path)
-			num := strings.SplitN(fname, "_", 2)[0]
-			uintNum, err := strconv.ParseUint(num, 10, 64)
-			if err == nil {
-				if uint(uintNum) > maxn {
-					maxn = uint(uintNum)
-				}
-			}
+	_ = filepath.Walk(migrationsPath, func(path string, info fs.FileInfo, err error) error {
+		if v, ok := migrationFileVersion(path); ok && v > maxn {
+			maxn = v
 		}
 		return nil
 	})
 	return maxn
+}
+
+// logMigrationDataHeader reports where the database is and where the files
+// could take it, before anything runs.
+//
+// The dirty flag is the reason this exists: golang-migrate runs each file
+// untransacted, so a statement that fails mid-file leaves the version recorded
+// and dirty, and every later run refuses with "Dirty database version N". Seeing
+// that up front -- next to the versions actually available on disk -- is the
+// difference between "force N and re-run" and reading a driver error.
+//
+// Never fatal: this is diagnostics. A database that cannot answer still gets its
+// migration attempted, and the failure is reported by the command itself.
+func logMigrationDataHeader(db *sql.DB, migrationsPath string) {
+	if db != nil {
+		var version uint64
+		var dirty bool
+		err := db.QueryRow("SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&version, &dirty)
+		var myErr *sqldriver.MySQLError
+		switch {
+		// This runs before WithInstance creates schema_migrations, so a fresh
+		// database surfaces either as no rows or as "table doesn't exist" (1146).
+		case errors.Is(err, sql.ErrNoRows) || (errors.As(err, &myErr) && myErr.Number == 1146):
+			slog.Info("schema_migrations: no version recorded (fresh database)")
+		case err != nil:
+			slog.Warn("schema_migrations: could not read version", slog.String("error", err.Error()))
+		default:
+			slog.Info("schema_migrations", slog.Uint64("version", version), slog.Bool("dirty", dirty))
+		}
+	}
+
+	up, down := lastMigrationVersions(migrationsPath)
+	slog.Info("migrations available", slog.Uint64("last_up", uint64(up)), slog.Uint64("last_down", uint64(down)))
+}
+
+// migrationFileVersion extracts the leading numeric version from a migration
+// filename (e.g. "00042_add_foo.up.sql" -> 42). ok is false for non-.sql files
+// or names without a numeric prefix.
+func migrationFileVersion(path string) (version uint, ok bool) {
+	if !strings.HasSuffix(path, ".sql") {
+		return 0, false
+	}
+	_, fname := filepath.Split(path)
+	num, _, _ := strings.Cut(fname, "_")
+	v, err := strconv.ParseUint(num, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return uint(v), true
+}
+
+// lastMigrationVersions reports the highest up and down versions on disk
+// separately, because an up without its down is a real and common mistake and
+// the two numbers differing is the cheapest way to see it.
+func lastMigrationVersions(migrationsPath string) (up, down uint) {
+	_ = filepath.Walk(migrationsPath, func(path string, info fs.FileInfo, err error) error {
+		v, ok := migrationFileVersion(path)
+		if !ok {
+			return nil
+		}
+		if strings.HasSuffix(path, ".up.sql") && v > up {
+			up = v
+		}
+		if strings.HasSuffix(path, ".down.sql") && v > down {
+			down = v
+		}
+		return nil
+	})
+	return up, down
 }
